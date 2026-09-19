@@ -18,27 +18,33 @@ const SAMPLE = {
     { name: "常温区", t_min: 15, t_max: 25 },
   ],
   // 分段运输:各段时长之和 14 + 6 + 4 = 24h
+  // 前两段同属锁温组「陆运」:这两段必须共用同一个设定点
   segments: [
     {
       name: "干线冷链",
       hours: 14,
+      lock_group: "陆运",
       zones: [
         { name: "深冷区", t_min: -30, t_max: -18 },
         { name: "冷冻区", t_min: -18, t_max: -2 },
         { name: "冷藏区", t_min: 0, t_max: 8 },
+        { name: "双温柜A", t_min: 10, t_max: 14 },
       ],
     },
     {
       name: "支线转运",
       hours: 6,
+      lock_group: "陆运",
       zones: [
         { name: "冷冻区", t_min: -18, t_max: -2 },
         { name: "冷藏区", t_min: 0, t_max: 8 },
+        { name: "双温柜B", t_min: 16, t_max: 20 },
       ],
     },
     {
       name: "末端配送",
       hours: 4,
+      lock_group: "",
       zones: [
         { name: "冷藏区", t_min: 0, t_max: 8 },
         { name: "常温区", t_min: 15, t_max: 25 },
@@ -56,6 +62,7 @@ const SAMPLE = {
     { name: "温控疫苗", units: 12, unit_volume: 0.15, t_min: 2, t_max: 8, max_transport_hours: 12 },
     { name: "巧克力", units: 30, unit_volume: 0.2, t_min: 15, t_max: 22, max_transport_hours: "" },
     { name: "热带水果(温区缺失)", units: 10, unit_volume: 0.4, t_min: 10, t_max: 14, max_transport_hours: "" },
+    { name: "双温试剂(锁温无共享点)", units: 8, unit_volume: 0.3, t_min: 10, t_max: 20, max_transport_hours: "" },
   ],
 };
 
@@ -96,8 +103,12 @@ function addSegmentCard(seg = {}) {
       <label class="seg-hours-label">时长 h
         <input class="seg-hours" type="number" min="0" step="0.5" value="${seg.hours ?? ""}" placeholder="如 14" />
       </label>
+      <label class="seg-lock-label">锁温组
+        <input class="seg-lock" type="text" value="${seg.lock_group ?? ""}" placeholder="可选,如 陆运" list="lockGroupOptions" />
+      </label>
       <button type="button" class="btn btn-del btn-del-segment">删除段</button>
     </div>
+    <div class="seg-lock-hint">相邻且同组的连续段共用同一个设定点(留空表示本段独立选点)</div>
     <div class="table-wrap">
       <table class="editable">
         <thead>
@@ -210,14 +221,22 @@ function readZones(tbody, rowPrefix = "") {
 function collectSegments() {
   const cards = [...$("segmentList").children];
   if (!cards.length) throw new Error("请至少添加一个运输段");
-  return cards.map((card, i) => {
+  const groups = [];
+  const segs = cards.map((card, i) => {
     const name = card.querySelector(".seg-name").value.trim() || `第 ${i + 1} 段`;
     const hours = num(card.querySelector(".seg-hours").value, "时长", `运输段「${name}」`);
     if (hours <= 0) throw new Error(`运输段「${name}」的时长必须大于 0`);
     const zones = readZones(card.querySelector(".seg-zone-rows"), `「${name}」`);
     if (!zones.length) throw new Error(`运输段「${name}」请至少添加一个可用温区`);
-    return { name, hours, zones };
+    const lock_group = card.querySelector(".seg-lock").value.trim() || null;
+    if (lock_group && !groups.includes(lock_group)) groups.push(lock_group);
+    return { name, hours, lock_group, zones };
   });
+  // 维护 datalist:方便给后续段选择已输入过的锁温组
+  $("lockGroupOptions").innerHTML = groups
+    .map((g) => `<option value="${escapeHtml(g)}"></option>`)
+    .join("");
+  return segs;
 }
 
 function collectInput() {
@@ -301,12 +320,37 @@ function renderSummary(s, unit) {
   `;
 }
 
+/* 锁温组条:列出箱内每个锁温块的共享设定点 */
+function renderLockGroups(box) {
+  const groups = box.lock_groups || [];
+  if (!groups.length) return "";
+  const chips = groups
+    .map((g) => {
+      const segText = g.segment_nos.map((n) => `第 ${n} 段`).join(" + ");
+      const names = g.segment_names.map(escapeHtml).join("、");
+      return `<span class="lock-chip" title="涉及运输段:${names}">
+        🔒 锁温组「${escapeHtml(g.lock_group)}」
+        <small>${segText} · ${fmt(g.hours)}h</small>
+        → 共享设定点 <strong>${fmt(g.shared_setpoint)}℃</strong>
+        <small class="muted">(共享可行域 ${fmtSegs(g.shared_temperature_segments)})</small>
+      </span>`;
+    })
+    .join("");
+  return `<div class="lock-groups">${chips}</div>`;
+}
+
 function renderSegmentChecks(box) {
   const rows = box.segment_checks
     .map((c) => {
       const icon = c.ok ? "✓" : "✗";
+      const lockChip = c.lock_shared
+        ? ` <span class="lock-mini" title="锁温组「${c.lock_group}」:本段与相邻同组段共用该设定点">🔒 ${escapeHtml(c.lock_group)}</span>`
+        : "";
+      const setpointText = c.lock_shared
+        ? `共享设定点 ${fmt(c.recommended_setpoint)}℃`
+        : `设定点 ${fmt(c.recommended_setpoint)}℃`;
       const detail = c.ok
-        ? `可设定 ${fmtSegs(c.temperature_segments)} · 设定点 ${fmt(c.recommended_setpoint)}℃ · ${c.matched_zones.map(escapeHtml).join("、")}`
+        ? `可设定 ${fmtSegs(c.temperature_segments)} · ${setpointText}${lockChip} · ${c.matched_zones.map(escapeHtml).join("、")}`
         : escapeHtml(c.reason || "该段无可用温区");
       return `<tr class="${c.ok ? "seg-ok" : "seg-bad"}">
         <td class="num">${icon}</td>
@@ -399,6 +443,7 @@ function renderBox(box, unit, segmentMode) {
       容量 ${fmt(box.used_volume)} / ${fmt(box.capacity)} ${unit}（${pct}%）${heatNote}
     </div>
     <div class="cap-bar"><i style="width:${pct}%"></i></div>
+    ${segmentMode ? renderLockGroups(box) : ""}
     ${segmentMode ? renderSegmentChecks(box) : ""}
     ${renderHeatExposure(box)}
     <table class="items">
@@ -423,10 +468,21 @@ function renderUnloaded(unloaded, unit) {
     const heatBadge = u.first_exceeded_segment_name
       ? `<span class="seg-badge">首次超限:第 ${u.first_exceeded_segment_no} 段 · ${escapeHtml(u.first_exceeded_segment_name)}</span>`
       : "";
+    const lockBadge = u.failed_lock_group
+      ? `<span class="seg-badge lock-badge">🔒 首个失败锁温组「${escapeHtml(u.failed_lock_group)}」:${(u.failed_lock_segments || [])
+          .map((s) => `第 ${s.segment_no} 段 · ${escapeHtml(s.name)}`)
+          .join("、")}${
+          u.failed_lock_intersection_empty_segment_name
+            ? `(交集于第 ${u.failed_lock_intersection_empty_segment_no} 段「${escapeHtml(
+                u.failed_lock_intersection_empty_segment_name
+              )}」变空)`
+            : ""
+        }</span>`
+      : "";
     const div = document.createElement("div");
     div.className = "unloaded-item";
     div.innerHTML = `
-      <div class="u-title">⛔ #${u.batch_no} ${escapeHtml(u.name)} — 未能装载 ${fmt(u.units)} 件（${fmt(u.volume)} ${unit}）${segBadge}${heatBadge}</div>
+      <div class="u-title">⛔ #${u.batch_no} ${escapeHtml(u.name)} — 未能装载 ${fmt(u.units)} 件（${fmt(u.volume)} ${unit}）${segBadge}${heatBadge}${lockBadge}</div>
       <div class="u-reason">原因：${escapeHtml(u.reason)}</div>`;
     wrap.appendChild(div);
   });

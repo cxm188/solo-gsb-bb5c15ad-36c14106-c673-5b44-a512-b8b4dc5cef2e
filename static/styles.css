@@ -150,6 +150,19 @@ body {
   white-space: nowrap;
 }
 .seg-hours-label input { width: 90px; }
+.seg-lock-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  color: var(--blue-dark);
+}
+.seg-lock-label input { width: 110px; }
+.seg-lock-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin: 0 0 6px 2px;
+}
 .segment-card .btn-add-seg-zone { margin-top: 6px; }
 
 /* ---------- 输入控件 ---------- */
@@ -309,6 +322,40 @@ table.seg-checks tr:last-child td { border-bottom: none; }
 table.seg-checks tr.seg-ok td:first-child { color: var(--ok); font-weight: 700; }
 table.seg-checks tr.seg-bad td { background: var(--err-bg); }
 table.seg-checks tr.seg-bad td:first-child { color: var(--err); font-weight: 700; }
+
+/* ---------- 锁温组 ---------- */
+.lock-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 14px 0;
+}
+.lock-chip {
+  display: inline-block;
+  border: 1px solid #c9b8ec;
+  background: #f4eefd;
+  color: #5b2ea1;
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12.5px;
+}
+.lock-chip strong { font-size: 13px; }
+.lock-chip small { font-weight: 400; }
+.lock-mini {
+  display: inline-block;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: #f4eefd;
+  border: 1px solid #c9b8ec;
+  color: #5b2ea1;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.lock-badge {
+  border-color: #c9b8ec;
+  color: #5b2ea1;
+}
 
 /* ---------- 热暴露预算 ---------- */
 .heat-table { margin-top: 10px; }

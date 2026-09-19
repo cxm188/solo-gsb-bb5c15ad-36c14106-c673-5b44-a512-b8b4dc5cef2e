@@ -14,6 +14,14 @@
   该批首选区间的距离;每段从可行区间端点与首选区间端点中选取使本段结束后
   箱内最大累计预算使用率最低的点,平局取较低温度。任何货物累计超预算时
   该装箱组合不可用;未填写预算的批次保持原规则。
+- 支持锁温区段(锁温组):运输段可选填写 lock_group;相邻且同组的连续段
+  组成一个锁温块,块内各段必须共用同一个设定点。该点必须落在块内每一段
+  可行温度段(箱内允许温区交集 ∩ 该段各温区,可能不连续)交集形成的真实
+  区间内;候选点取这些真实区间的端点以及落在其中的首选区间端点,结合组前
+  累计热暴露,选择使"组结束时箱内最大累计预算使用率"最低的共享设定点,
+  平局取较低温度;箱内无预算批次时取块内最宽共享区间中点。不存在共享点
+  (块内各段可行温度段交集为空)时拒绝该装箱组合,并报告首个失败锁温组及
+  其涉及的运输段。未形成相邻同组连续段(仅孤立出现)的组按普通段处理。
 - 同一批货物可按"件"为最小单位拆分到多个箱子。
 - 采用 First-Fit-Decreasing 启发式:温度下限越低(要求越苛刻)的批次优先,
   同温限按总体积降序;依次塞入已有箱子,放不下再开新箱。
@@ -68,12 +76,95 @@ class _Zone:
 
 @dataclass
 class _Segment:
-    """一个运输段:按顺序执行,段内可使用一组温区。"""
+    """一个运输段:按顺序执行,段内可使用一组温区。
+
+    lock_group 为用户填写的锁温组名(可空);只有相邻且同组的连续段才会
+    真正组成锁温块,孤立填写的组名按普通段处理。
+    """
 
     no: int
     name: str
     hours: float
     zones: list[_Zone]
+    lock_group: str | None = None
+
+
+@dataclass
+class _LockBlock:
+    """锁温块:相邻同组的连续运输段共用一个设定点;单段块不产生约束。"""
+
+    segs: list[_Segment]
+    locked: bool
+
+    @property
+    def group(self) -> str | None:
+        return self.segs[0].lock_group if self.locked else None
+
+
+def _build_lock_blocks(segments: list[_Segment]) -> list[_LockBlock]:
+    """把相邻且同组的连续段合并为锁温块;空组或孤立同组段退化为单段块。"""
+    blocks: list[_LockBlock] = []
+    i = 0
+    while i < len(segments):
+        g = segments[i].lock_group
+        j = i + 1
+        if g is not None:
+            while j < len(segments) and segments[j].lock_group == g:
+                j += 1
+        locked = g is not None and j - i > 1
+        blocks.append(_LockBlock(segs=segments[i:j], locked=locked))
+        i = j
+    return blocks
+
+
+def _segment_feasible_set(seg: _Segment, feasible: _Iv) -> list[_Iv]:
+    """一段的可行温度段:箱内允许温区交集 ∩ 该段各温区,合并相邻后返回。"""
+    return _merge_segments(
+        [s for z in seg.zones if (s := feasible.intersect(z.iv)) is not None]
+    )
+
+
+def _intersect_interval_sets(a: list[_Iv], b: list[_Iv]) -> list[_Iv]:
+    """两个(可能多段的)区间并集的交集,结果可能为空或不连续。"""
+    out: list[_Iv] = []
+    for x in a:
+        for y in b:
+            iv = x.intersect(y)
+            if iv is not None:
+                out.append(iv)
+    return _merge_segments(out)
+
+
+def _shared_feasible_set(
+    segs: list[_Segment], feasible: _Iv
+) -> tuple[list[_Iv], int]:
+    """锁温块各段可行温度段的交集;返回(交集区间列表,首个无交集段的序号)。
+
+    首个失败段的序号基于块内顺序(0 起)。
+    """
+    shared = _segment_feasible_set(segs[0], feasible)
+    if not shared:
+        return [], 0
+    for k, seg in enumerate(segs[1:], start=1):
+        shared = _intersect_interval_sets(
+            shared, _segment_feasible_set(seg, feasible)
+        )
+        if not shared:
+            return [], k
+    return shared, -1
+
+
+def _first_failed_lock(
+    blocks: list[_LockBlock], feasible: _Iv
+) -> _LockBlock | None:
+    """返回首个"各段可行温度段交集为空"的锁温块;全部存在共享点时返回 None。"""
+    for block in blocks:
+        if not block.locked:
+            continue
+        shared, _ = _shared_feasible_set(block.segs, feasible)
+        if not shared:
+            return block
+    return None
 
 
 def _first_failed_segment(segments: list[_Segment], iv: _Iv) -> _Segment | None:
@@ -97,18 +188,22 @@ class _Box:
     index: int
     capacity: float
     segments: list[_Segment]
+    blocks: list[_LockBlock]
     used: float = 0.0
     items: list[_Loaded] = field(default_factory=list)
     # 已装入货物允许温区的交集;首件货物装入时初始化
     feasible: _Iv | None = None
     # 箱内批次(按批号去重),用于热暴露核算
     lots: list["_Batch"] = field(default_factory=list)
-    # 最近一次 try_load 失败原因:capacity / temp / budget
+    # 最近一次 try_load 失败原因:capacity / temp / lock / budget
     last_fail: str | None = None
+    # last_fail == "lock" 时的细节:首个失败锁温块
+    last_failed_lock: _LockBlock | None = None
 
     def try_load(self, batch: "_Batch", iv: _Iv) -> bool:
         """尝试装入 1 件货物,成功则更新箱内温度交集与容量。"""
         self.last_fail = None
+        self.last_failed_lock = None
         if self.used + batch.unit_volume > self.capacity + EPS:
             self.last_fail = "capacity"
             return False
@@ -120,16 +215,25 @@ class _Box:
         if _first_failed_segment(self.segments, new_feasible) is not None:
             self.last_fail = "temp"
             return False
+        # 锁温块:相邻同组的段必须存在共享设定点(各段可行温度段的交集非空)
+        failed_block = _first_failed_lock(self.blocks, new_feasible)
+        if failed_block is not None:
+            self.last_fail = "lock"
+            self.last_failed_lock = failed_block
+            return False
         already_in = any(lot.no == batch.no for lot in self.lots)
         if not already_in:
             # 新批次进入会收窄可行温度区间,需按新组合重算逐段设定点与
             # 各批累计热暴露;任何一批超预算则该装箱组合不可用
             new_lots = self.lots + [batch]
-            if any(lot.budget is not None for lot in new_lots) and not _simulate_heat(
-                self.segments, new_feasible, new_lots
-            )["ok"]:
-                self.last_fail = "budget"
-                return False
+            if any(lot.budget is not None for lot in new_lots):
+                sim = _simulate_heat(self.blocks, new_feasible, new_lots)
+                if not sim["ok"]:
+                    self.last_fail = (
+                        "lock" if sim["failed_lock"] is not None else "budget"
+                    )
+                    self.last_failed_lock = sim["failed_lock"]
+                    return False
         if self.items and self.items[-1].batch_no == batch.no:
             self.items[-1].units += 1
             self.items[-1].volume = _r(self.items[-1].volume + batch.unit_volume)
@@ -147,13 +251,6 @@ class _Box:
         if not already_in:
             self.lots.append(batch)
         return True
-
-    def can_take(self, iv: _Iv) -> bool:
-        """该箱是否在温区上能容纳此温度区间的货物(不考虑剩余容量)。"""
-        candidate = iv if self.feasible is None else self.feasible.intersect(iv)
-        return candidate is not None and _first_failed_segment(
-            self.segments, candidate
-        ) is None
 
 
 @dataclass
@@ -188,72 +285,126 @@ def _merge_segments(segs: list[_Iv]) -> list[_Iv]:
     return merged
 
 
-def _simulate_heat(
-    segments: list[_Segment], feasible: _Iv, lots: list[_Batch]
-) -> dict[str, Any]:
-    """对给定箱内批次组合,逐段贪心选取设定点并累计各批热暴露。
+def _setpoint_candidates(
+    feas_set: list[_Iv], budgeted: list["_Batch"], pref_lots: list["_Batch"]
+) -> set[float]:
+    """候选设定点:可行区间端点 + 落在可行区间内的各批首选区间端点。"""
+    cands: set[float] = set()
+    for s in feas_set:
+        cands.update((s.lo, s.hi))
+    for lot in pref_lots:
+        assert lot.pref is not None
+        for ep in (lot.pref.lo, lot.pref.hi):
+            if any(s.lo - EPS <= ep <= s.hi + EPS for s in feas_set):
+                cands.add(ep)
+    return cands
 
-    每段候选设定点 = 该段可行区间(箱内允许温区交集 ∩ 该段各温区,可能为
-    多段并集)的端点,以及落在可行区间内的各批首选区间端点;选取使"本段
-    结束后箱内最大累计预算使用率"最低的点,平局取较低温度。箱内没有填写
-    度时预算的批次时,退化为原规则(最宽可行区间的中点)。
+
+def _simulate_heat(
+    blocks: list[_LockBlock], feasible: _Iv, lots: list[_Batch]
+) -> dict[str, Any]:
+    """对给定箱内批次组合,按锁温块逐段确定设定点并累计各批热暴露。
+
+    - 普通单段块:从该段可行区间(箱内允许温区交集 ∩ 该段各温区,可能为
+      多段并集)的端点,以及落在可行区间内的各批首选区间端点中,选取使
+      "本段结束后箱内最大累计预算使用率"最低的点,平局取较低温度;
+    - 锁温块(相邻同组连续段):各段必须共用同一设定点。该点必须落在块内
+      每段可行温度段的交集(真实区间,可能不连续)中;结合组前累计热暴露,
+      选取使"组结束时箱内最大累计预算使用率"最低的共享设定点,平局取较
+      低温度。块内各段可行温度段交集为空时,该装箱组合不可用。
+    - 箱内没有填写度时预算的批次时,退化为原规则:普通段取最宽可行区间的
+      中点,锁温块取最宽共享区间的中点(各段仍然同点)。
     """
     budgeted = [lot for lot in lots if lot.budget is not None]
     pref_lots = [lot for lot in lots if lot.pref is not None]
     cumulative: dict[int, float] = {lot.no: 0.0 for lot in pref_lots}
     first_exceeded: dict[int, int] = {}
-    setpoints: list[float | None] = []
+    setpoints: dict[int, float | None] = {}
+    failed_lock: _LockBlock | None = None
+    failed_lock_seg_no: int | None = None
 
-    for seg in segments:
-        feas_set = _merge_segments(
-            [s for z in seg.zones if (s := feasible.intersect(z.iv)) is not None]
-        )
-        if not feas_set:
-            # 理论上不可达(装箱前已逐段校验温区覆盖),仅作兜底
-            setpoints.append(None)
+    def record_exposure(seg: _Segment, t: float | None) -> None:
+        if t is None:
+            return
+        for lot in pref_lots:
+            cumulative[lot.no] += seg.hours * _dist_to_iv(t, lot.pref)
+        for lot in budgeted:
+            if (
+                lot.no not in first_exceeded
+                and cumulative[lot.no] > lot.budget + EPS  # type: ignore[operator]
+            ):
+                first_exceeded[lot.no] = seg.no
+
+    for block in blocks:
+        if not block.locked:
+            # 普通段:保持逐段贪心
+            seg = block.segs[0]
+            feas_set = _segment_feasible_set(seg, feasible)
+            if not feas_set:
+                # 理论上不可达(装箱前已逐段校验温区覆盖),仅作兜底
+                setpoints[seg.no] = None
+                continue
+            if not budgeted:
+                widest = max(feas_set, key=lambda s: s.hi - s.lo)
+                t: float | None = (widest.lo + widest.hi) / 2
+            else:
+                cands = _setpoint_candidates(feas_set, budgeted, pref_lots)
+                best_t, best_obj = None, float("inf")
+                for cand in sorted(cands):
+                    obj = max(
+                        _usage_ratio(
+                            cumulative[lot.no]
+                            + seg.hours * _dist_to_iv(cand, lot.pref),
+                            lot.budget if lot.budget is not None else 0.0,
+                        )
+                        for lot in budgeted
+                    )
+                    if best_t is None or obj < best_obj - EPS:
+                        best_obj, best_t = obj, cand
+                t = best_t
+            setpoints[seg.no] = t
+            record_exposure(seg, t)
             continue
+
+        # 锁温块:先求各段可行温度段的真实交集
+        shared, fail_k = _shared_feasible_set(block.segs, feasible)
+        if not shared:
+            failed_lock = block
+            failed_lock_seg_no = block.segs[fail_k].no
+            for seg in block.segs:
+                setpoints[seg.no] = None
+            break
+        block_hours = sum(s.hours for s in block.segs)
         if not budgeted:
-            widest = max(feas_set, key=lambda s: s.hi - s.lo)
+            widest = max(shared, key=lambda s: s.hi - s.lo)
             t = (widest.lo + widest.hi) / 2
         else:
-            cands: set[float] = set()
-            for s in feas_set:
-                cands.update((s.lo, s.hi))
-            for lot in pref_lots:
-                assert lot.pref is not None
-                for ep in (lot.pref.lo, lot.pref.hi):
-                    if any(s.lo - EPS <= ep <= s.hi + EPS for s in feas_set):
-                        cands.add(ep)
-            best_t: float | None = None
-            best_obj = float("inf")
+            cands = _setpoint_candidates(shared, budgeted, pref_lots)
+            best_t, best_obj = None, float("inf")
             for cand in sorted(cands):
+                # 目标:组结束时箱内最大累计预算使用率(组前累计 + 整组暴露)
                 obj = max(
                     _usage_ratio(
-                        cumulative[lot.no] + seg.hours * _dist_to_iv(cand, lot.pref),
+                        cumulative[lot.no]
+                        + block_hours * _dist_to_iv(cand, lot.pref),
                         lot.budget if lot.budget is not None else 0.0,
                     )
                     for lot in budgeted
                 )
                 if best_t is None or obj < best_obj - EPS:
-                    best_obj = obj
-                    best_t = cand
+                    best_obj, best_t = obj, cand
             t = best_t
-        setpoints.append(t)
-        for lot in pref_lots:
-            cumulative[lot.no] += seg.hours * _dist_to_iv(t, lot.pref)
-        for lot in budgeted:
-            if (
-                lot.budget is not None
-                and lot.no not in first_exceeded
-                and cumulative[lot.no] > lot.budget + EPS
-            ):
-                first_exceeded[lot.no] = seg.no
+        for seg in block.segs:
+            setpoints[seg.no] = t
+            record_exposure(seg, t)
 
     return {
         "setpoints": setpoints,
         "exposures": cumulative,
         "first_exceeded": first_exceeded,
-        "ok": not first_exceeded,
+        "failed_lock": failed_lock,
+        "failed_lock_seg_no": failed_lock_seg_no,
+        "ok": failed_lock is None and not first_exceeded,
     }
 
 
@@ -296,7 +447,17 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
             zones = _parse_zones(s.get("zones") or [], f"运输段 {name} 的")
             if not zones:
                 raise ValueError(f"运输段 {name} 至少需要定义一个可用温区")
-            segments.append(_Segment(no=i + 1, name=name, hours=hours, zones=zones))
+            lg = s.get("lock_group")
+            lock_group = str(lg).strip() if lg not in (None, "") else None
+            segments.append(
+                _Segment(
+                    no=i + 1,
+                    name=name,
+                    hours=hours,
+                    zones=zones,
+                    lock_group=lock_group,
+                )
+            )
             total_hours += hours
         total_hours = _r(total_hours)
         if th_raw not in (None, ""):
@@ -320,6 +481,9 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
         segments.append(
             _Segment(no=1, name="全程", hours=transport_hours, zones=zones)
         )
+
+    # 相邻且同组的连续段组成锁温块,块内必须共用设定点
+    blocks = _build_lock_blocks(segments)
 
     batches: list[_Batch] = []
     for i, c in enumerate(payload.get("cargoes") or []):
@@ -423,23 +587,60 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 )
             continue
 
+        # 2.5) 锁温组预检:该批单独装箱时,每个锁温块都必须存在共享设定点。
+        # 拼箱只会进一步收窄可行温度,单独装箱即失败则任何组合均不可用。
+        solo_lock_block = _first_failed_lock(blocks, b.iv)
+        if solo_lock_block is not None:
+            _, fail_k = _shared_feasible_set(solo_lock_block.segs, b.iv)
+            fail_seg = solo_lock_block.segs[fail_k]
+            involved = "、".join(
+                f"第 {s.no} 段「{s.name}」" for s in solo_lock_block.segs
+            )
+            add_unloaded(
+                b,
+                b.units,
+                f"锁温组「{solo_lock_block.group}」涉及的运输段({involved})"
+                f"在允许温区 [{_r(b.iv.lo)}, {_r(b.iv.hi)}]℃ 下不存在共用设定点:"
+                f"截至第 {fail_seg.no} 段「{fail_seg.name}」,各段可行温度段的交集"
+                f"已为空,该锁温组合无法装箱",
+                failed_lock_group=solo_lock_block.group,
+                failed_lock_segments=[
+                    {"segment_no": s.no, "name": s.name, "hours": _r(s.hours)}
+                    for s in solo_lock_block.segs
+                ],
+                failed_lock_intersection_empty_segment_no=fail_seg.no,
+                failed_lock_intersection_empty_segment_name=fail_seg.name,
+            )
+            continue
+
         # 3) 先尝试已有箱子(First-Fit)
         remaining = b.units
         unusable_boxes = 0
         budget_blocked = False
+        lock_blocked = False
         for box in boxes:
             if remaining == 0:
                 break
-            if not box.can_take(b.iv):
+            # 先做空载外的快速温区/锁温判定,避免无谓重算
+            candidate = (
+                b.iv if box.feasible is None else box.feasible.intersect(b.iv)
+            )
+            if (
+                candidate is None
+                or _first_failed_segment(segments, candidate) is not None
+                or _first_failed_lock(blocks, candidate) is not None
+            ):
                 unusable_boxes += 1
                 continue
             while remaining > 0 and box.try_load(b, b.iv):
                 remaining -= 1
             if remaining > 0:
-                # 温区兼容但本箱容量已不足或热暴露预算超限
+                # 温区兼容但本箱容量已不足、锁温组无共享点或热暴露预算超限
                 unusable_boxes += 1
                 if box.last_fail == "budget":
                     budget_blocked = True
+                elif box.last_fail == "lock":
+                    lock_blocked = True
 
         # 4) 开新箱继续装,直到装完或达到上限
         while remaining > 0:
@@ -453,12 +654,15 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                         if b.iv.intersect(z.iv) is not None
                     ]
                     compatible_note = f"温区兼容({_fmt_names(covering)})"
+                reject_reasons = []
+                if unusable_boxes:
+                    reject_reasons.append("无兼容温度")
+                reject_reasons.append("容量不足")
+                if lock_blocked:
+                    reject_reasons.append("锁温组无共享设定点")
                 if budget_blocked:
-                    detail = "均无兼容温度、容量不足或热暴露预算超限"
-                elif unusable_boxes:
-                    detail = "均无兼容温度或容量不足"
-                else:
-                    detail = "容量不足"
+                    reject_reasons.append("热暴露预算超限")
+                detail = "、".join(reject_reasons[:-1]) + "或" + reject_reasons[-1]
                 add_unloaded(
                     b,
                     remaining,
@@ -476,11 +680,16 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                     new_box_failed=True,
                 )
                 break
-            box = _Box(index=len(boxes) + 1, capacity=box_capacity, segments=segments)
+            box = _Box(
+                index=len(boxes) + 1,
+                capacity=box_capacity,
+                segments=segments,
+                blocks=blocks,
+            )
             if not box.try_load(b, b.iv):
                 if box.last_fail == "budget" and b.budget is not None:
                     # 单独装箱即超预算:可行区间只会随拼箱收窄,任何组合均不可用
-                    sim = _simulate_heat(segments, b.iv, [b])
+                    sim = _simulate_heat(blocks, b.iv, [b])
                     first_no = sim["first_exceeded"].get(b.no)
                     first_seg = segments[first_no - 1] if first_no else None
                     exceeded_note = (
@@ -532,27 +741,44 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
     for box in boxes:
         assert box.feasible is not None
         # 逐段设定点:箱内有预算批次时按"最大累计预算使用率最低"贪心选取,
-        # 否则保持原规则(最宽可行区间中点)
-        heat_sim = _simulate_heat(box.segments, box.feasible, box.lots)
+        # 否则保持原规则(最宽可行区间中点);锁温块内各段共用同一设定点
+        heat_sim = _simulate_heat(box.blocks, box.feasible, box.lots)
         setpoints = heat_sim["setpoints"]
+        # 段序号 -> 所属锁温块(仅真正的多段锁温块)
+        block_of_seg: dict[int, _LockBlock] = {}
+        lock_groups_out: list[dict[str, Any]] = []
+        for blk in box.blocks:
+            if not blk.locked:
+                continue
+            shared, _ = _shared_feasible_set(blk.segs, box.feasible)
+            group_no = len(lock_groups_out) + 1
+            entry = {
+                "group_no": group_no,
+                "lock_group": blk.group,
+                "segment_nos": [s.no for s in blk.segs],
+                "segment_names": [s.name for s in blk.segs],
+                "hours": _r(sum(s.hours for s in blk.segs)),
+                "shared_setpoint": _r(setpoints[blk.segs[0].no]),
+                "shared_temperature_segments": [
+                    {"t_min": _r(s.lo), "t_max": _r(s.hi)} for s in shared
+                ],
+            }
+            lock_groups_out.append(entry)
+            for s in blk.segs:
+                block_of_seg[s.no] = blk
         # 逐段校验:每段可设定温度 = 箱内货物共同交集 ∩ 该段各温区,再合并相邻段
         segment_checks: list[dict[str, Any]] = []
         envelope_raw: list[_Iv] = []
         transportable = True
-        for idx, seg in enumerate(box.segments):
-            merged = _merge_segments(
-                [
-                    s
-                    for z in seg.zones
-                    if (s := box.feasible.intersect(z.iv)) is not None
-                ]
-            )
+        for seg in box.segments:
+            merged = _segment_feasible_set(seg, box.feasible)
             matched = [
                 z.name
                 for z in seg.zones
                 if box.feasible.intersect(z.iv) is not None
             ]
             ok = bool(merged)
+            lock_blk = block_of_seg.get(seg.no)
             check: dict[str, Any] = {
                 "segment_no": seg.no,
                 "name": seg.name,
@@ -563,8 +789,10 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 ],
                 "matched_zones": matched,
                 "recommended_setpoint": (
-                    _r(setpoints[idx]) if setpoints[idx] is not None else None
+                    _r(setpoints[seg.no]) if setpoints.get(seg.no) is not None else None
                 ),
+                "lock_group": lock_blk.group if lock_blk else None,
+                "lock_shared": lock_blk is not None,
             }
             if ok:
                 envelope_raw.extend(merged)
@@ -649,6 +877,7 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 "matched_zones": matched_all,
                 "transportable": transportable,
                 "segment_checks": segment_checks,
+                "lock_groups": lock_groups_out,
                 "heat_exposure": heat_exposure,
                 "heat_exposure_ok": heat_sim["ok"],
                 "used_volume": _r(box.used),
@@ -685,6 +914,7 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 "segment_no": seg.no,
                 "name": seg.name,
                 "hours": _r(seg.hours),
+                "lock_group": seg.lock_group,
                 "zones": [
                     {"name": z.name, "t_min": _r(z.iv.lo), "t_max": _r(z.iv.hi)}
                     for z in seg.zones

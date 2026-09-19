@@ -15,6 +15,13 @@ class SegmentIn(BaseModel):
         None, description="运输段名称,如:干线运输;留空自动按顺序命名"
     )
     hours: float = Field(..., gt=0, description="该段运输时长(小时)")
+    lock_group: str | None = Field(
+        None,
+        description="锁温组名(可选):相邻且同组的连续运输段必须共用同一个设定点,"
+        "规划器在这些段可行温度段的真实交集中,结合组前累计热暴露选取使组结束时"
+        "箱内最大预算使用率最低的共享设定点(平局取较低温度);"
+        "无共享点时拒绝该装箱组合。孤立出现(相邻段不同组)的组名按普通段处理",
+    )
     zones: list[ZoneIn] = Field(..., min_length=1, description="该段可用温区列表")
 
 
