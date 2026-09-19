@@ -17,11 +17,12 @@ const SAMPLE = {
     { name: "冷藏区", t_min: 0, t_max: 8 },
     { name: "常温区", t_min: 15, t_max: 25 },
   ],
-  // 分段运输:各段时长之和 14 + 6 + 4 = 24h
+  // 分段运输:各段时长之和 14 + 6 + 4 = 24h;干线与支线同锁温组,共用设定点
   segments: [
     {
       name: "干线冷链",
       hours: 14,
+      lock_group: "干线锁温",
       zones: [
         { name: "深冷区", t_min: -30, t_max: -18 },
         { name: "冷冻区", t_min: -18, t_max: -2 },
@@ -31,6 +32,7 @@ const SAMPLE = {
     {
       name: "支线转运",
       hours: 6,
+      lock_group: "干线锁温",
       zones: [
         { name: "冷冻区", t_min: -18, t_max: -2 },
         { name: "冷藏区", t_min: 0, t_max: 8 },
@@ -95,6 +97,9 @@ function addSegmentCard(seg = {}) {
       <input class="seg-name" type="text" value="${seg.name ?? ""}" placeholder="段名称,如 干线冷链" />
       <label class="seg-hours-label">时长 h
         <input class="seg-hours" type="number" min="0" step="0.5" value="${seg.hours ?? ""}" placeholder="如 14" />
+      </label>
+      <label class="seg-lock-label">锁温组
+        <input class="seg-lock" type="text" value="${seg.lock_group ?? ""}" placeholder="可选" title="相邻且同组的段共用一个设定点" />
       </label>
       <button type="button" class="btn btn-del btn-del-segment">删除段</button>
     </div>
@@ -216,7 +221,8 @@ function collectSegments() {
     if (hours <= 0) throw new Error(`运输段「${name}」的时长必须大于 0`);
     const zones = readZones(card.querySelector(".seg-zone-rows"), `「${name}」`);
     if (!zones.length) throw new Error(`运输段「${name}」请至少添加一个可用温区`);
-    return { name, hours, zones };
+    const lockGroup = card.querySelector(".seg-lock").value.trim();
+    return { name, hours, zones, lock_group: lockGroup || null };
   });
 }
 
@@ -305,12 +311,18 @@ function renderSegmentChecks(box) {
   const rows = box.segment_checks
     .map((c) => {
       const icon = c.ok ? "✓" : "✗";
+      const lockBadge = c.lock_group
+        ? `<span class="lock-badge" title="相邻同组段共用设定点">🔒 ${escapeHtml(c.lock_group)}</span>`
+        : "";
+      const setpointText = c.lock_group
+        ? `共享设定点 ${fmt(c.shared_setpoint)}℃（锁温组「${escapeHtml(c.lock_group)}」· 第 ${c.lock_group_segments.join("、")} 段共用）`
+        : `设定点 ${fmt(c.recommended_setpoint)}℃`;
       const detail = c.ok
-        ? `可设定 ${fmtSegs(c.temperature_segments)} · 设定点 ${fmt(c.recommended_setpoint)}℃ · ${c.matched_zones.map(escapeHtml).join("、")}`
+        ? `可设定 ${fmtSegs(c.temperature_segments)} · ${setpointText} · ${c.matched_zones.map(escapeHtml).join("、")}`
         : escapeHtml(c.reason || "该段无可用温区");
       return `<tr class="${c.ok ? "seg-ok" : "seg-bad"}">
         <td class="num">${icon}</td>
-        <td>第 ${c.segment_no} 段 · ${escapeHtml(c.name)}<small class="muted">（${fmt(c.hours)}h）</small></td>
+        <td>第 ${c.segment_no} 段 · ${escapeHtml(c.name)}${lockBadge}<small class="muted">（${fmt(c.hours)}h）</small></td>
         <td>${detail}</td>
       </tr>`;
     })
@@ -423,10 +435,13 @@ function renderUnloaded(unloaded, unit) {
     const heatBadge = u.first_exceeded_segment_name
       ? `<span class="seg-badge">首次超限:第 ${u.first_exceeded_segment_no} 段 · ${escapeHtml(u.first_exceeded_segment_name)}</span>`
       : "";
+    const lockBadge = u.failed_lock_group
+      ? `<span class="seg-badge">锁温组「${escapeHtml(u.failed_lock_group)}」无共享设定点:第 ${u.failed_lock_segments.map((s) => s.segment_no).join("、")} 段</span>`
+      : "";
     const div = document.createElement("div");
     div.className = "unloaded-item";
     div.innerHTML = `
-      <div class="u-title">⛔ #${u.batch_no} ${escapeHtml(u.name)} — 未能装载 ${fmt(u.units)} 件（${fmt(u.volume)} ${unit}）${segBadge}${heatBadge}</div>
+      <div class="u-title">⛔ #${u.batch_no} ${escapeHtml(u.name)} — 未能装载 ${fmt(u.units)} 件（${fmt(u.volume)} ${unit}）${segBadge}${heatBadge}${lockBadge}</div>
       <div class="u-reason">原因：${escapeHtml(u.reason)}</div>`;
     wrap.appendChild(div);
   });

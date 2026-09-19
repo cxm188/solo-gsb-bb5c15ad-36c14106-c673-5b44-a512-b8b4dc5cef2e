@@ -12,7 +12,7 @@
       <span class="logo">❄</span>
       <div>
         <h1>冷链装箱温控规划器</h1>
-        <p>按温区兼容、容量约束与累计热暴露预算自动生成分箱方案</p>
+        <p>按温区兼容、容量约束、累计热暴露预算与锁温区段自动生成分箱方案</p>
       </div>
     </div>
     <div class="actions">
@@ -63,7 +63,7 @@
 
       <div id="segmentSection" hidden>
         <div class="section-head">
-          <h2>运输段 <small class="muted">(按执行顺序)</small></h2>
+          <h2>运输段 <small class="muted">(按执行顺序;相邻且锁温组相同的段共用一个设定点)</small></h2>
           <button id="btnAddSegment" type="button" class="btn btn-small">+ 添加运输段</button>
         </div>
         <div id="segmentList"></div>

@@ -150,6 +150,13 @@ body {
   white-space: nowrap;
 }
 .seg-hours-label input { width: 90px; }
+.seg-lock-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.seg-lock-label input { width: 110px; }
 .segment-card .btn-add-seg-zone { margin-top: 6px; }
 
 /* ---------- 输入控件 ---------- */
@@ -279,6 +286,19 @@ table.items tr:last-child td { padding-bottom: 10px; }
   background: #fff;
   border: 1px solid #e8c2bf;
   color: var(--err);
+  font-size: 11.5px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+
+.lock-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--ice);
+  border: 1px solid #bfd8f2;
+  color: var(--blue-dark);
   font-size: 11.5px;
   font-weight: 600;
   vertical-align: 1px;
